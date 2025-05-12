@@ -1,0 +1,940 @@
+import json
+from datetime import datetime
+import grpc
+import pandas as pd
+import os
+from ast import literal_eval
+import matplotlib.pyplot as plt
+import numpy as np
+import warnings
+import networkx as nx
+from scipy.spatial import cKDTree
+
+from google.protobuf.json_format import MessageToDict
+from services_proto_files import HistoricalData_pb2, HistoricalData_pb2_grpc, MiningAdvanceSimulation_pb2_grpc, \
+    MiningAdvanceSimulation_pb2
+from pathlib import Path
+
+warnings.filterwarnings('ignore')
+from ast import literal_eval
+
+class CureGPS:
+    def __init__(self):
+        self.df_shovels= pd.DataFrame()
+        self.df_trucks = pd.DataFrame()
+        self.df_destinations = pd.DataFrame()
+        self.df_routes = pd.DataFrame()
+        self.diff_seconds=0
+
+    def clean_data(self):
+        self.df_shovels= pd.DataFrame()
+        self.df_trucks = pd.DataFrame()
+        self.df_destinations = pd.DataFrame()
+        self.df_routes = pd.DataFrame()
+        self.diff_seconds=0
+        
+    def clean_files(self):
+        pass
+    
+    def set_data(self):
+        """consulta a dos servicios gRPC para obtener datos históricos de equipos mineros, 
+        específicamente palas y camiones, y luego procesa esta información para almacenarla 
+        en DataFrames de pandas."""
+        
+        print("consulta servicio pablo")
+        with grpc.insecure_channel(os.getenv('GPS_HISTORICAL_SERVICE')) as channel:
+            connection=HistoricalData_pb2_grpc.HistoricalDataServiceStub(channel)
+            response=connection.GetEquipment(HistoricalData_pb2.EquipmentRequest(n_last_responses=50))
+        response = MessageToDict(response)
+        shovels_list = []
+        trucks_list = []
+        print("consulta finalizada pablo")
+
+        ################Produccion
+        #bfdvkfdbvfd
+        ## PROBANDO 2
+        # for item in response["itemObject"]:
+        #     raw_item = item["item"]
+        #     try:
+        #         # Primera carga: convierte string codificado en string plano JSON
+        #         intermediate = json.loads(raw_item.strip())
+        #
+        #         # Segunda carga: convierte string plano en dict real
+        #         item_data = json.loads(intermediate)
+        #
+        #         # Validar y usar
+        #         if isinstance(item_data, dict):
+        #             timestamp = item_data.get("TIMESTAMP", "")
+        #
+        #             for shovel in item_data.get("SHOVELS", []):
+        #                 shovel["timestamp"] = timestamp
+        #                 shovels_list.append(shovel)
+        #
+        #             for truck in item_data.get("TRUCKS", []):
+        #                 truck["timestamp"] = timestamp
+        #                 trucks_list.append(truck)
+        #         else:
+        #             print("item_data no es dict incluso después de doble carga:", item_data)
+        #
+        #     except json.JSONDecodeError as e:
+        #         print("Error decodificando JSON:", e)
+        #         print("Contenido original:", raw_item)
+
+        ##########################Test
+            # PROBANDO
+        
+        # Sobre la respuesta evaluamos cada item
+        
+        for item in response["itemObject"]:
+            item_data = json.loads(item["item"])
+            timestamp = item_data["TIMESTAMP"]  # Extraer el timestamp
+            # Agregar el timestamp a cada registro de shovels y trucks
+            for shovel in item_data["SHOVELS"]:
+                # shovel es un diccionario con los datos de la pala
+                shovel["timestamp"] = timestamp
+                shovels_list.append(shovel)
+            for truck in item_data["TRUCKS"]:
+                # truck es un diccionario con los datos del camión
+                truck["timestamp"] = timestamp
+                trucks_list.append(truck)
+        
+        print(type(trucks_list))
+        # print(trucks_list)
+        self.df_shovels = pd.DataFrame(shovels_list)
+        self.df_trucks = pd.DataFrame(trucks_list)
+        # Una vez creamos nuestros df's 
+
+        # self.df_destinations = pd.DataFrame(response["destinations"])
+        print("consulta servicio kenyi")
+
+        with grpc.insecure_channel(os.getenv('SERVER2_GRPC_URL')) as channel:
+            connection=MiningAdvanceSimulation_pb2_grpc.MiningAdvanceSimulationServiceStub(channel)
+            response=connection.GetLatestRoutes(MiningAdvanceSimulation_pb2.EmptyRoutes())
+        print("consulta finalizada kenyi")
+
+        route_response = MessageToDict(response)
+        print(self.df_trucks.head())
+        
+        # Ahora preparamos las fechas para obtener el RANGO ----------------ACA MODIFICO PARA UPDATE TIME DE LLEGADA DE DATOS
+        df_timestamp=self.df_trucks.copy()
+        
+        df_timestamp["timestamp"] = pd.to_datetime(df_timestamp["timestamp"])
+
+        print("mostramos columnas",df_timestamp.columns)
+        df_timestamp["UPDATEDTIME"] = pd.to_datetime(df_timestamp["UPDATEDTIME"])
+        
+        # Obtener valores mínimo y máximo
+        min_time = df_timestamp["timestamp"].min()
+        max_time = df_timestamp["timestamp"].max()# <- RANGO DE FECHAS
+        
+        # Modificaciones
+        print("Mostrando actualizacion: ########################3\n")
+        print("Antes:", self.df_trucks.shape)
+        
+        # Completo datos
+        self.df_trucks['DESTINATION_ID'].replace(r'^\s*$', pd.NA, regex=True, inplace=True)
+        self.df_trucks["DESTINATION_ID"].fillna("Unknown", inplace=True)
+        
+        # Elimino filas sin updated time
+        # Recuperando filas con data? 
+        # self.df_trucks['UPDATEDTIME'].replace(r'^\s*$', pd.NA, regex=True, inplace=True)
+        # self.df_trucks.dropna(subset=['UPDATEDTIME'], inplace=True)                     # La idea es mantener esta data en su mayoría: -> proximo a comentar
+        print("Después:", self.df_trucks.shape)
+        
+        self.diff_seconds = (max_time - min_time).total_seconds()
+        print("diferencia",self.diff_seconds)
+        # Calcular la diferencia en segundos
+        self.df_routes = pd.DataFrame(route_response["routeDetails"])
+        # df_routes.to_csv("df_routes.csv", index=False)
+        # self.df_shovels.to_csv("df_shovel.csv",index=False)
+        self.df_trucks.to_csv("df_trucks.csv",index=False)
+        print("termine de guardar nueva version ##########################")
+        # self.df_destinations.to_csv("df_destinations.csv",index=False)
+
+    def add_shovel_direction(self,df_shovels, distance=20):
+        """
+        Añade columnas con el punto de dirección de las palas
+
+        Args:
+            df_shovels: DataFrame con datos de palas (debe contener HEADING, POSITIONX, POSITIONY)
+            distance: Distancia en metros para el punto de dirección
+
+        Returns:
+            DataFrame con columnas adicionales: DIRECTION_X, DIRECTION_Y
+        """
+        # Hacer copia para no modificar el original
+        df = df_shovels.copy()
+
+        # Asegurarnos que las columnas son numéricas
+        df['POSITIONX'] = pd.to_numeric(df['POSITIONX'])
+        df['POSITIONY'] = pd.to_numeric(df['POSITIONY'])
+        df['HEADING'] = pd.to_numeric(df['HEADING'])
+
+        # Fuente de error por calculo de angulos, baja precisión. 
+        # evaluar delay para calculo de dirección sin un valor 20 
+        
+        # Calcular la dirección (usando trigonometría)
+        df['DIRECTION_X'] = df['POSITIONX'] + distance * np.sin(np.radians(df['HEADING']))
+        df['DIRECTION_Y'] = df['POSITIONY'] + distance * np.cos(np.radians(df['HEADING']))
+
+        return df
+
+    def get_movement_snapshots(self,df_shovels_with_direction):
+        # Asegurar orden por SHOVEL_ID y timestamp descendente (último primero)
+        df = df_shovels_with_direction.sort_values(['SHOVEL_ID', 'timestamp'], ascending=[True, False])
+
+        results = []
+
+        # Agrupar por SHOVEL_ID
+        for shovel_id, group in df.groupby('SHOVEL_ID'):
+            group = group.reset_index(drop=True)
+            last_row = group.iloc[0]
+
+            # Buscar el primer cambio de posición hacia atrás (comparado con last_row)
+            for i in range(1, len(group)):
+                row = group.iloc[i]
+                if (row['POSITIONX'], row['POSITIONY'], row['POSITIONZ']) != \
+                        (last_row['POSITIONX'], last_row['POSITIONY'], last_row['POSITIONZ']):
+                    results.append(row)  # fila donde cambió
+                    break
+
+            results.append(last_row)  # siempre guardar la última fila
+
+        # Crear DataFrame con los resultados
+        df_final = pd.DataFrame(results)
+        return df_final.reset_index(drop=True)
+
+    def generate_buckets(self):
+        self.df_shovels=self.df_shovels.drop_duplicates(subset=["SHOVEL_ID","POSITIONX","POSITIONY","POSITIONZ","STATUS"])
+        df_shovels = self.df_shovels[self.df_shovels["STATUS"] == "Loading"]
+        df_shovels_with_direction = self.add_shovel_direction(df_shovels)
+        df_shovels_with_direction.reset_index(drop=True, inplace=True)
+        all_results = []
+        shovel_names = df_shovels_with_direction["SHOVEL_ID"].unique()
+        print(shovel_names)
+        for shovel in shovel_names:
+            df_shovel_t=df_shovels_with_direction[df_shovels_with_direction["SHOVEL_ID"]==shovel].copy()
+            df_shovel_t.reset_index(drop=True,inplace=True)
+            df_proc = self.get_movement_snapshots(df_shovel_t)
+            all_results.append(df_proc)
+
+        df_buckets = pd.concat(all_results, ignore_index=True)
+        f_name=datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+
+        df_buckets["UPDATEDTIME"] = pd.to_datetime(df_buckets["UPDATEDTIME"])
+        df_buckets['UNIX_TIMESTAMP'] = df_buckets['UPDATEDTIME'].astype('int64') // 10**9
+        # df_buckets["UPDATEDTIME"] = pd.to_datetime(df_buckets["UPDATEDTIME"])
+        # df_buckets['UNIX_TIMESTAMP'] = (
+        #         df_buckets['UPDATEDTIME'].dt.hour * 3600 +
+        #         df_buckets['UPDATEDTIME'].dt.minute * 60 +
+        #         df_buckets['UPDATEDTIME'].dt.second
+        # )
+        df_buckets=df_buckets[["SHOVEL_ID","DIRECTION_X","DIRECTION_Y","POSITIONZ","UNIX_TIMESTAMP","SPEED","STATE","STATUS","DESTINATION_ID"]]
+
+        df_buckets.rename(columns={"SHOVEL_ID":"MACHINENAME",
+                                   "DIRECTION_X":"COORDX",
+                                   "DIRECTION_Y":"COORDY",
+                                   "POSITIONZ":"COORDZ",
+                                   "UNIX_TIMESTAMP":"TIMESTAMPLOCAL",
+                                   "STATE":"state",
+                                   "STATUS":"status",
+                                   "DESTINATION_ID":"destiny",
+                                   "SPEED":"speed"
+                                   },inplace=True)
+        df_buckets["HEADING"]=0
+        df_buckets["PITCH"]=0
+        df_buckets["ROLL"]=0
+        df_buckets["destiny"]="No data"
+        df_buckets["loaded"]=False
+        self.df_shovels=df_buckets
+        # df_buckets.to_csv(f"files/GPS/Buckets/{f_name}_buckets.csv",index=False)
+
+    def construir_grafo(self,df):
+        """
+            Método `construir_grafo`: Crea un grafo dirigido a partir de un DataFrame que contiene información de nodos y conexiones.
+            Parámetros:
+            - df: DataFrame de pandas que debe incluir las siguientes columnas:
+                - 'numNumero': identificador único de cada nodo.
+                - 'numX', 'numY', 'numZ': coordenadas espaciales de cada nodo.
+                - 'oid': identificador de segmento para agrupar nodos relacionados.
+                - 'numPointNr': número de punto para ordenar nodos dentro de un segmento.
+                - 'txtNumero': cadena con identificadores de nodos conectados, separados por comas.
+                - 'idTypeWay': tipo de conexión (2 indica bidireccional).
+            Funcionalidad:
+            1. Inicializa un grafo dirigido usando NetworkX.
+            2. Añade nodos al grafo con sus respectivas posiciones (coordenadas).
+            3. Para cada grupo de nodos con el mismo 'oid', conecta nodos consecutivos respetando el orden de 'numPointNr'. Si la conexión es bidireccional ('idTypeWay' == 2), añade aristas en ambos sentidos.
+            4. Añade conexiones adicionales definidas en la columna 'txtNumero', agregando aristas desde el nodo origen hacia los nodos destino especificados. También respeta la bidireccionalidad.
+            5. Devuelve el grafo dirigido construido.
+            Este método permite representar y analizar redes o caminos definidos en el DataFrame para su uso en aplicaciones como sistemas de transporte o análisis de rutas.
+        """
+        G = nx.DiGraph()
+
+        # Añadir nodos
+        for _, row in df.iterrows():
+            nodo = row['numNumero']
+            G.add_node(nodo, pos=(row['numX'], row['numY'], row['numZ']))
+
+        # Conexiones por secuencia de puntos dentro del mismo segmento (oid)
+        for oid, grupo in df.groupby('oid'):
+            grupo_ordenado = grupo.sort_values('numPointNr')
+            bidireccional = grupo_ordenado['idTypeWay'].iloc[0] == 2
+            nodos = grupo_ordenado['numNumero'].values
+
+            for i in range(len(nodos) - 1):
+                a, b = nodos[i], nodos[i + 1]
+                G.add_edge(a, b)
+                if bidireccional:
+                    G.add_edge(b, a)
+
+        # Añadir aristas desde txtNumero
+        for _, row in df.iterrows():
+            origen = row['numNumero']
+            conexiones = str(row['txtNumero']).split(',') if pd.notnull(row['txtNumero']) else []
+            bidireccional = row['idTypeWay'] == 2
+
+            for destino_txt in conexiones:
+                try:
+                    destino = int(destino_txt.strip())
+                    G.add_edge(origen, destino)
+                    if bidireccional:
+                        G.add_edge(destino, origen)
+                except ValueError:
+                    continue  # Saltar si no es convertible a int
+
+        return G
+
+    def construir_kdtree(self,df):
+        posiciones = df[['numNumero', 'numX', 'numY', 'numZ']].dropna()
+        puntos = posiciones[['numX', 'numY', 'numZ']].values
+        nodos = posiciones['numNumero'].values
+        kdtree = cKDTree(puntos)
+        return kdtree, nodos, puntos
+
+
+    def obtener_ruta_con_trazado(self,grafo, kdtree, nodos, puntos, origen_xyz, destino_xyz):
+        """
+            Método `obtener_ruta_con_trazado`: Encuentra la ruta más corta entre dos nodos en un grafo utilizando un árbol KD para la búsqueda de nodos.
+            Parámetros:
+            - grafo: Un grafo dirigido construido con NetworkX que representa la red de nodos y conexiones.
+            - kdtree: Un árbol KD que permite realizar búsquedas eficientes de nodos en el espacio tridimensional.
+            - nodos: Un array o lista que contiene los identificadores de los nodos en el grafo.
+            - puntos: Un conjunto de puntos que puede ser utilizado para otras operaciones (no se utiliza directamente en este método).
+            - origen_xyz: Coordenadas (x, y, z) del nodo de origen desde el cual se desea encontrar la ruta.
+            - destino_xyz: Coordenadas (x, y, z) del nodo de destino al cual se desea llegar.
+            Funcionalidad:
+            1. Utiliza el árbol KD para encontrar el índice del nodo más cercano al origen y al destino basándose en sus coordenadas.
+            2. Recupera los nodos correspondientes a esos índices.
+            3. Intenta obtener el diccionario de caminos más cortos desde el nodo de origen utilizando `nx.single_source_shortest_path`.
+            4. Verifica si el nodo de destino está en los caminos encontrados:
+            - Si está presente, devuelve la ruta desde el origen hasta el destino.
+            - Si no se encuentra una ruta, devuelve None.
+            5. Maneja la excepción `nx.NetworkXNoPath` en caso de que no exista un camino entre los nodos.
+            Este método es útil para la navegación y planificación de rutas en redes complejas, permitiendo encontrar trayectorias óptimas entre puntos en un espacio tridimensional.
+        """
+        _, idx_origen = kdtree.query(origen_xyz)
+        _, idx_destino = kdtree.query(destino_xyz)
+
+        nodo_origen = nodos[idx_origen]
+        nodo_destino = nodos[idx_destino]
+
+        # print(f"Origen: {nodo_origen}, Destino: {nodo_destino}")
+
+        try:
+            # Obtener el diccionario de caminos más cortos desde nodo_origen
+            caminos = nx.single_source_shortest_path(grafo, nodo_origen)
+            # print(f"Caminos desde el origen {nodo_origen}: {caminos}")
+
+            if nodo_destino in caminos:
+                ruta = caminos[nodo_destino]
+                # print(f"Ruta encontrada")
+                return ruta
+            else:
+                # print(f"No se encuentra una ruta hacia {nodo_destino}")
+                return None
+        except nx.NetworkXNoPath:
+            # print(f"NetworkXNoPath: No se encontró ruta entre {nodo_origen} y {nodo_destino}")
+            return None
+    
+    
+    def calcular_velocidad(self, df_trucks):
+        """
+        Genera la velocidad de los camiones a partir de las posiciones y el tiempo.
+        """
+        # print("antes", df_trucks.shape)
+        # print("Columnas:", df_trucks.columns)
+        
+        # # Verificar el tipo de datos de la columna timestamp antes de la conversión
+        # print("Tipo de timestamp antes:", type(df_trucks['timestamp'].iloc[0]))
+        # print("Primeros 5 valores de timestamp:", df_trucks['timestamp'].head())
+        
+        # Convertir a datetime si no lo está ya
+        df_trucks['timestamp'] = pd.to_datetime(df_trucks['timestamp'])
+        
+        # Verificar después de la conversión
+        # print("Tipo de timestamp después:", type(df_trucks['timestamp'].iloc[0]))
+        
+        # Ordenar por ID y tiempo
+        df_trucks.sort_values(by=['TRUCK_ID', 'timestamp'], inplace=True)
+        df_trucks.reset_index(drop=True, inplace=True)
+        
+        # # Imprimir algunos valores ordenados para verificar
+        # print("Muestra de datos ordenados (TRUCK_ID y timestamp):")
+        # print(df_trucks[['TRUCK_ID', 'timestamp']].head(10))
+        
+        # Calcular la distancia entre posiciones consecutivas
+        df_trucks['distx'] = df_trucks['X'].diff().fillna(0)
+        df_trucks['disty'] = df_trucks['Y'].diff().fillna(0)
+        df_trucks['distz'] = df_trucks['Z'].diff().fillna(0)
+        
+        # Calcular la distancia euclidiana
+        df_trucks['distance'] = np.sqrt(df_trucks['distx']**2 + df_trucks['disty']**2 + df_trucks['distz']**2)
+        
+        # Calcular el tiempo entre posiciones consecutivas en segundos
+        df_trucks['time_diff_raw'] = df_trucks['timestamp'].diff()
+        # print("Primeras diferencias de tiempo (raw):")
+        # print(df_trucks['time_diff_raw'].head(10))
+        
+        df_trucks['time_diff'] = df_trucks['time_diff_raw'].dt.total_seconds().fillna(1)
+        
+        # # Verificar los valores de time_diff
+        # print("Valores de time_diff después del cálculo:")
+        # print(df_trucks['time_diff'].head(10))
+        # print("Valores únicos de time_diff:", df_trucks['time_diff'].unique()[:20])
+        
+        # Asegurarse de que no hay valores de time_diff iguales a cero
+        # que podrían causar divisiones por cero
+        df_trucks.loc[df_trucks['time_diff'] == 0, 'time_diff'] = 1
+        
+        # Calcular la velocidad
+        df_trucks['SPEED_NEW'] = df_trucks['distance'] / df_trucks['time_diff'] * (36/10) # m/s a km/h
+        
+        # Agregar información de la primera fila por cada grupo TRUCK_ID
+        # La primera fila tras ordenar por cada ID tendrá NaN en diff, identificarlas:
+        # print("Filas con time_diff = 1 (posiblemente primeras filas de cada grupo):")
+        # print(df_trucks[df_trucks['time_diff'] == 1].shape[0])
+        
+        # print("Columnas:", df_trucks.columns)
+        # print("despues", df_trucks.shape)
+        return df_trucks
+
+
+    def interpolar_ruta_camion(self, truck_row, ruta_nodos, grafo, puntos_nodos, current_position, new_position,
+                                next_updatedtime):
+        """
+        Interpola el movimiento de un camión generando un punto por segundo entre UPDATEDTIME actual y siguiente.
+        Si la ruta es irreal (requiere más velocidad que 60 km/h), interpola directamente entre los dos puntos.
+        """
+
+        # Usamos UPDATEDTIME en lugar de timestamp
+        start_time = pd.to_datetime(truck_row['UPDATEDTIME'])
+        end_time = pd.to_datetime(next_updatedtime)
+
+        # Calculamos la cantidad de segundos de diferencia
+        total_seconds = int((end_time - start_time).total_seconds())
+        if total_seconds < 1:
+            total_seconds = 1  # al menos un punto
+
+        puntos = []
+        interpolated_positions = []
+
+        # Construimos la lista de posiciones a seguir
+        if ruta_nodos and len(ruta_nodos) > 1:
+            kdtree = cKDTree(puntos_nodos)
+            _, idx_cercano = kdtree.query(current_position)
+            nodo_inicio = ruta_nodos.index(idx_cercano) if idx_cercano in ruta_nodos else 0
+
+            punto_actual = np.array(current_position)
+            posiciones = [punto_actual]
+
+            for i in range(nodo_inicio, len(ruta_nodos) - 1):
+                id_b = ruta_nodos[i + 1]
+                pos_b = np.array(grafo.nodes[id_b]['pos'])
+                posiciones.append(pos_b)
+        else:
+            posiciones = [np.array(current_position), np.array(new_position)]
+
+        # Calcular distancia total y distancias entre segmentos
+        total_dist = 0
+        distancias = []
+        for i in range(len(posiciones) - 1):
+            d = np.linalg.norm(posiciones[i + 1] - posiciones[i])
+            distancias.append(d)
+            total_dist += d
+
+        # Validar si la distancia es alcanzable con velocidad máxima
+        max_speed_m_s = 60 * 1000 / 3600  # 60 km/h = 16.67 m/s        # Cambiado para evaluar los saltos
+        max_possible_dist = total_seconds * max_speed_m_s
+
+        if total_dist > max_possible_dist:
+            print(f"Ruta descartada por irreal: distancia {total_dist:.2f}m en {total_seconds}s (máx posible {max_possible_dist:.2f}m)")
+            posiciones = [np.array(current_position), np.array(new_position)]
+            total_dist = np.linalg.norm(posiciones[1] - posiciones[0])
+            distancias = [total_dist]
+
+        if total_dist == 0:
+            posiciones = [posiciones[0], posiciones[0] + 0.001]
+            total_dist = 0.001
+            distancias = [total_dist]
+
+        # Interpolamos cada segundo
+        fracciones = np.linspace(0, 1, total_seconds)
+
+        recorrido_acumulado = 0
+        tramo_idx = 0
+        for f in fracciones:
+            distancia_objetivo = f * total_dist
+
+            while tramo_idx < len(distancias) and recorrido_acumulado + distancias[tramo_idx] < distancia_objetivo:
+                recorrido_acumulado += distancias[tramo_idx]
+                tramo_idx += 1
+
+            if tramo_idx >= len(distancias):
+                punto = posiciones[-1]
+            else:
+                tramo_inicio = posiciones[tramo_idx]
+                tramo_fin = posiciones[tramo_idx + 1]
+                tramo_longitud = distancias[tramo_idx]
+                alpha = 0 if tramo_longitud == 0 else (distancia_objetivo - recorrido_acumulado) / tramo_longitud
+                punto = tramo_inicio + (tramo_fin - tramo_inicio) * alpha
+
+            interpolated_positions.append(punto)
+
+        # Tiempos: uno por segundo
+        tiempos_interpolados = pd.date_range(start=start_time, periods=total_seconds, freq='S')
+
+        for pos, ts in zip(interpolated_positions, tiempos_interpolados):
+            puntos.append({
+                'TRUCK_ID': truck_row['TRUCK_ID'],
+                'X': pos[0],
+                'Y': pos[1],
+                'Z': pos[2],
+                'timestamp': ts,
+                'speed': truck_row['SPEED'],                    #Liverlin -> Calcular la velocidad luego
+                'load_state': truck_row['STATE'],
+                'status': truck_row['STATUS'],
+                'destiny': truck_row['DESTINATION_ID'],
+                'loaded': truck_row["LOADED"]
+            })
+
+        return pd.DataFrame(puntos)
+    
+    def interpolar_ruta_camion_V2(self, truck_row, ruta_nodos, grafo, puntos_nodos, current_position, new_position,
+                                next_updatedtime):
+        """
+        Interpola el movimiento de un camión generando un punto por segundo entre UPDATEDTIME actual y siguiente.
+        Si la ruta es irreal (requiere más velocidad que 60 km/h), interpola directamente entre los dos puntos.
+        """
+
+        # Usamos UPDATEDTIME en lugar de timestamp
+        start_time = pd.to_datetime(truck_row['UPDATEDTIME'])
+        end_time = pd.to_datetime(next_updatedtime)
+
+        # Calculamos la cantidad de segundos de diferencia (incluye ambos extremos)
+        # Modificación: usamos rango inclusivo para asegurar tanto inicio como fin
+        tiempos_interpolados = pd.date_range(start=start_time, end=end_time, freq='S')
+        total_seconds = len(tiempos_interpolados)
+        if total_seconds < 1:
+            total_seconds = 1
+            tiempos_interpolados = pd.date_range(start=start_time, periods=1, freq='S')
+
+        interpolated_positions = []
+
+        # Construimos la lista de posiciones a seguir
+        if ruta_nodos and len(ruta_nodos) > 1:
+            kdtree = cKDTree(puntos_nodos)
+            _, idx_cercano = kdtree.query(current_position)
+            nodo_inicio = ruta_nodos.index(idx_cercano) if idx_cercano in ruta_nodos else 0
+
+            posiciones = [np.array(current_position)]
+            for i in range(nodo_inicio, len(ruta_nodos) - 1):
+                id_b = ruta_nodos[i + 1]
+                posiciones.append(np.array(grafo.nodes[id_b]['pos']))
+        else:
+            posiciones = [np.array(current_position), np.array(new_position)]
+
+        # Calcular distancia total y distancias entre segmentos
+        distancias = [np.linalg.norm(posiciones[i + 1] - posiciones[i])
+                      for i in range(len(posiciones) - 1)]
+        total_dist = sum(distancias)
+
+        # Validar si la distancia es alcanzable con velocidad máxima
+        max_speed_m_s = 60 * 1000 / 3600  # Modificación: corregido a 60 km/h -> 16.67 m/s
+        max_possible_dist = (total_seconds - 1) * max_speed_m_s
+
+        if total_dist > max_possible_dist:
+            print(f"Ruta descartada por irreal: distancia {total_dist:.2f}m en {total_seconds-1}s (máx posible {max_possible_dist:.2f}m)")
+            posiciones = [np.array(current_position), np.array(new_position)]
+            distancias = [np.linalg.norm(posiciones[1] - posiciones[0])]
+            total_dist = distancias[0]
+
+        if total_dist == 0:
+            # Evitar división por cero en alpha
+            posiciones = [posiciones[0], posiciones[0] + 0.001]
+            distancias = [0.001]
+            total_dist = 0.001
+
+        # Interpolamos por fracción de distancia usando el mismo número de puntos que timestamps
+        fracciones = np.linspace(0, 1, total_seconds)
+        recorrido_acumulado = 0.0
+        tramo_idx = 0
+
+        for f in fracciones:
+            distancia_objetivo = f * total_dist
+            # Avanzar al tramo correspondiente
+            while tramo_idx < len(distancias) and recorrido_acumulado + distancias[tramo_idx] < distancia_objetivo:
+                recorrido_acumulado += distancias[tramo_idx]
+                tramo_idx += 1
+
+            if tramo_idx >= len(distancias):
+                punto = posiciones[-1]
+            else:
+                inicio = posiciones[tramo_idx]
+                fin = posiciones[tramo_idx + 1]
+                largo = distancias[tramo_idx]
+                alpha = 0 if largo == 0 else (distancia_objetivo - recorrido_acumulado) / largo
+                punto = inicio + (fin - inicio) * alpha
+
+            interpolated_positions.append(punto)
+
+        # Construcción del DataFrame de salida con velocidad calculada dinámicamente
+        puntos = []
+        for i, (pos, ts) in enumerate(zip(interpolated_positions, tiempos_interpolados)):
+            if i == 0:
+                speed_kmh = truck_row['SPEED']  # Modificación: primer punto conserva velocidad original
+            else:
+                dist = np.linalg.norm(interpolated_positions[i] - interpolated_positions[i - 1])
+                speed_kmh = (dist / 1) * 3.6  # m/s a km/h
+
+            puntos.append({
+                'TRUCK_ID': truck_row['TRUCK_ID'],
+                'X': pos[0],
+                'Y': pos[1],
+                'Z': pos[2],
+                'timestamp': ts,
+                'speed': speed_kmh,  # Modificación: velocidad variable
+                'load_state': truck_row['STATE'],
+                'status': truck_row['STATUS'],
+                'destiny': truck_row['DESTINATION_ID'],
+                'loaded': truck_row['LOADED']
+            })
+
+        return pd.DataFrame(puntos)
+
+    def calcular_angulos(self,grupo):
+        dx = grupo['X'].diff().shift(-1)
+        dy = grupo['Y'].diff().shift(-1)
+        dz = grupo['Z'].diff().shift(-1)
+
+        horiz_dist = np.sqrt(dx ** 2 + dy ** 2)
+
+        # Cálculo de ángulos con protección contra división por cero
+        azimut = np.degrees(np.arctan2(dy, dx))
+        inclinacion = np.degrees(np.arctan2(dz, horiz_dist))
+
+        # Detectar vectores nulos (sin movimiento)
+        sin_movimiento = (dx == 0) & (dy == 0) & (dz == 0)
+
+        # Reemplazar ángulos donde no hay movimiento con NaN para aplicar ffill()
+        azimut[sin_movimiento] = np.nan
+        inclinacion[sin_movimiento] = np.nan
+
+        # Agregar columnas al grupo
+        grupo['heading'] = azimut.ffill()
+        grupo['pitch'] = inclinacion.ffill()
+        grupo['dx'] = dx.fillna(0)
+        grupo['dy'] = dy.fillna(0)
+        grupo['dz'] = dz.fillna(0)
+
+        return grupo
+
+    def generate_truck_gps(self):
+        ########################### REVISAR BLOQUE DE GENERACION DE FECHAS ###################################
+        
+        ## Bloque: Filtrado inicial de rutas y construcción de estructuras de datos ##
+        # Importo el DataFrame de rutas y aplico filtros básicos
+        # Importo dataframe para modificacion
+        df_routes = self.df_routes
+        # columnas mayores a 0
+        print("MUESTRO COLUMNAS",df_routes.dtypes)
+        print("antes",df_routes.shape)
+        df_routes = df_routes[df_routes["numZ"] > 0]
+        df_routes = df_routes[df_routes["flgActive"] == 1]
+        print("despues",df_routes.shape)    
+        # Construyo el grafo de rutas y el k-d tree para búsqueda espacial
+        grafo = self.construir_grafo(df_routes)
+        # grafo = self.agregar_nodos_extras(grafo, self.df_destinations)
+        kdtree, nodos, puntos = self.construir_kdtree(df_routes)
+        puntos_nodos = np.array([grafo.nodes[n]['pos'] for n in grafo.nodes()])
+
+
+        ## Bloque: Preparación y filtrado de datos de camiones ##
+        # Convierto tipos de columnas relevantes a float
+        df_trucks=self.df_trucks
+        df_trucks[["POSITIONX", "POSITIONY", "POSITIONZ", "SPEED"]] = df_trucks[["POSITIONX", "POSITIONY", "POSITIONZ", "SPEED"]].astype(float)       
+        # print(" ################    df_trucks_f = df_trucks ",df_trucks.shape, "################")
+        df_trucks_f = df_trucks.copy()
+        # Filtro por patrón de TRUCK_ID y activo
+        df_trucks_f = df_trucks_f[
+            (df_trucks_f['TRUCK_ID'].str.match(r'^HT0(0[1-9]|[1-2][0-9]|3[0-2])$'))
+        ]
+        # Aseguro existencia de carpeta para historial
+        df_list = []
+        carpeta = Path('files/LastMovement/Trucks/')
+        carpeta.mkdir(parents=True, exist_ok=True)
+        # Conviero columnas de tiempo a datetime
+        df_trucks_f["timestamp"]=pd.to_datetime(df_trucks_f["timestamp"])
+        df_trucks_f["UPDATEDTIME"]=pd.to_datetime(df_trucks_f["UPDATEDTIME"])
+
+        
+        ## Bloque: Cálculo de ventana de tiempo y volcado de datos crudos ##        
+        print("differencia segundos",self.diff_seconds,"\n  minutos",self.diff_seconds/60)
+        # --- 1) Guardado df_val.csv: valores crudos de posiciones y tiempos de camiones filtrados
+        # Este CSV contiene las lecturas originales de cada camión (POSITIONX, POSITIONY, POSITIONZ, SPEED,
+        # timestamp, UPDATEDTIME) tras aplicar filtros de ID y tipo.
+        df_trucks_f.to_csv("df_val.csv",index=False)
+        # Determino la ventana de ventana de procesamiento
+        max_timestamp = df_trucks_f["UPDATEDTIME"].max() 
+        # Calculo ventana de tiempo: tomo el UPDATEDTIME máximo y resto diff_seconds
+        max_timestamp_restado = max_timestamp - pd.Timedelta(seconds=self.diff_seconds) # <- definicion de ventanas de tiempo
+        # print("max_timestamp_restado: ",type(max_timestamp_restado))
+        mask = (
+            (df_trucks_f["UPDATEDTIME"] >= max_timestamp_restado) & 
+            (df_trucks_f["UPDATEDTIME"] <= max_timestamp)
+        )
+        print("mask: ",mask)
+        # Si hay registros, tomamos el menor de esos timestamps
+        if not df_trucks_f[mask].empty:
+            new_limit_timestamp = df_trucks_f[mask]["UPDATEDTIME"].min()
+        else:
+            # Si no hay registros en ese rango, podrías decidir usar directamente el max_timestamp_restado
+            new_limit_timestamp = max_timestamp_restado
+        # Verificar si TRUCK_ID está tanto en columnas como en el índice
+        print("Index names:", df_trucks.index.names)
+        print("Columns:", df_trucks.columns)
+        # Resetear el índice si es necesario
+        if 'TRUCK_ID' in df_trucks.index.names:
+            df_trucks = df_trucks.reset_index()
+        print("fecha maxima: ",new_limit_timestamp)
+        
+        
+        ## Bloque: Inicialización o carga del filtro de tiempo persistido ##
+        # Lógica para cargar o inicializar time_filter.json
+        date_file_path="./files/time_filter.json"
+        ########################### REVISAR BLOQUE DE GENERACION DE FECHAS ###################################
+        if not os.path.exists(date_file_path):
+            # Si no existe, inicializo con el timestamp más reciente menos el diff
+            max_timestamp = df_trucks_f["timestamp"].max()
+            limit_date = max_timestamp - pd.Timedelta(seconds=int(self.diff_seconds))
+            limit_date=pd.Timestamp(limit_date)
+        else:
+            # Leo la última fecha límite guardad
+            with open(f"{date_file_path}", "r") as f:
+                limit_date = json.load(f)
+                limit_date=pd.Timestamp(limit_date["time_filter"])
+        print("fecha minima:",limit_date)
+        # df_trucks_f = self.generate_speed(df_trucks_f)
+        
+        
+        ################## Interpolación de rutas de cada camion #######################
+        for truck in df_trucks_f["TRUCK_ID"].unique():
+            ## Obtenemos el dataframe del camion
+            df_temp = df_trucks_f[df_trucks_f["TRUCK_ID"] == truck].copy()
+            # df_temp.sort_values(by=["timestamp"], inplace=True)
+            # df_temp.reset_index(drop=True, inplace=True)
+            file_path = f"files/LastMovement/Trucks/{truck}.json"
+            ##Obtenemos la primera fecha
+            # init_update = pd.to_datetime(df_temp.iloc[0]["timestamp"])
+            # df_current_pos = None
+            if not os.path.exists(file_path):
+                #Crear el archivo si no existe
+                df_temp.iloc[[0]].to_json(file_path, orient="records", lines=False)
+                #Liverlin revisar posibles errores 
+            else:
+                ## Si el archivo existe obtenemos los datos del archivo
+                df_truck_hist=pd.read_json(file_path,convert_dates=["UPDATEDTIME"])
+                last_update=pd.to_datetime(df_truck_hist.iloc[0]["UPDATEDTIME"])
+                if last_update < limit_date:
+                    print("menor")
+                    df_temp=df_temp[df_temp['UPDATEDTIME']>=limit_date]
+                    # init_pos=df_temp.iloc[[0]]
+                else:
+                    print("mayor")
+                    init_pos=df_truck_hist
+                    df_temp = pd.concat([init_pos, df_temp], ignore_index=True, sort=False)
+
+            ## Filtarmos por tiempo para que no obtenga valores menores a la ultima posición que se guardara
+            df_temp_p = df_temp.copy()
+            df_temp_p["timestamp"]=pd.to_datetime(df_temp_p["timestamp"])   # Verificar si se realizó bien la conversión
+            # df_temp_p = df_temp_p[df_temp_p["timestamp"] >= init_update].copy()
+            # df_temp_p = df_temp_p.drop_duplicates(subset=["POSITIONX", "POSITIONY", "POSITIONZ"]) --> Cancelo la eliminacion debido a que esto se da por el mismo updatedtime
+            
+            # Ordeno por timestamp de actualización y limpio índice
+            df_temp_p.sort_values(by=["UPDATEDTIME"], inplace=True)
+            df_temp_p.reset_index(drop=True, inplace=True)
+            print("after",len(df_temp_p))
+            
+            # Recorro pares de puntos para interpolar
+            for j in range(len(df_temp_p)):
+                ####### Primer nodo
+                row = df_temp_p.iloc[j]
+                current_node = (row["POSITIONX"], row["POSITIONY"], row["POSITIONZ"])
+
+                #### Si es el final termina
+                if j + 1 >= len(df_temp_p):
+                    continue
+                new_destiny = (df_temp_p.iloc[j + 1]["POSITIONX"], df_temp_p.iloc[j + 1]["POSITIONY"],
+                                df_temp_p.iloc[j + 1]["POSITIONZ"])
+                next_time = pd.to_datetime(df_temp_p.iloc[j + 1]["UPDATEDTIME"])
+                
+                ruta = self.obtener_ruta_con_trazado(grafo, kdtree, nodos, puntos, current_node, new_destiny)
+                df_routes = self.interpolar_ruta_camion(row, ruta, grafo, puntos_nodos, current_node, new_destiny,
+                                                        next_time)
+
+                current_time=df_temp_p.iloc[j]["timestamp"]
+                # print(f"id:{truck}, tamaño rutas: {len(df_routes)},{current_node},{new_destiny},{current_time},{next_time}")
+                df_list.append(df_routes.copy())
+        print(len(df_list))
+
+        
+        ## Bloque: Consolidación de resultados e inicial slicing ##
+        df_result = pd.concat(df_list, ignore_index=True)
+        max_timestamp=df_result["timestamp"].max()
+        time_filter=max_timestamp- pd.Timedelta(seconds=int(self.diff_seconds))
+        df_result.to_csv("df_result0.csv",index=False)
+        df_result=df_result[(df_result["timestamp"]>=limit_date) & (df_result["timestamp"]<=new_limit_timestamp) ]
+        # Liverlin
+        
+        
+        ## Bloque: Actualización de archivos JSON y persistencia del nuevo filtro ##
+        for truck in df_result["TRUCK_ID"].unique():
+            file_path = f"files/LastMovement/Trucks/{truck}.json"
+            df_update=df_result[df_result["TRUCK_ID"]==truck]
+            # df_update.sort_values("timestamp",inplace=True)
+            with open(f"{file_path}", "r") as f:
+                data = json.load(f)
+            df_temp=pd.DataFrame(data)
+            last_value=df_update.iloc[[-1]]
+            df_temp["POSITIONX"]=last_value["X"]
+            df_temp["POSITIONY"]=last_value["Y"]
+            df_temp["POSITIONZ"]=last_value["Z"]
+            df_temp["UPDATEDTIME"]=last_value["timestamp"]
+
+        # Guardo nueva fecha límite en JSON
+        data = {
+            "time_filter": time_filter.isoformat()
+        }
+        with open(f"{date_file_path}first_update.json", "w") as f:
+            json.dump(data, f)
+        # df_result.to_csv("df_final.csv",index=False)
+        if 'TRUCK_ID' in df_result.index.names:
+            df_result = df_result.reset_index()
+            
+            
+        ## Bloque: Cálculo de ángulos, velocidades y renombrado de columnas ##
+        df_result = df_result.groupby('TRUCK_ID', group_keys=False).apply(self.calcular_angulos) # -->esto lo comente
+        df_result["timestamp"] = pd.to_datetime(df_result["timestamp"])
+        df_result['UNIX_TIMESTAMP'] = df_result['timestamp'].astype('int64') // 10**9
+
+        # Aca calculo la velocidad por camion
+        if 'TRUCK_ID' in df_result.index.names:
+            df_result.index.name = None
+            df_result = df_result.reset_index()
+
+        df_result = df_result.groupby('TRUCK_ID', group_keys=False).apply(self.calcular_velocidad)
+        df_result.rename(columns={"TRUCK_ID": "MACHINENAME",
+                                    "X": "COORDX",
+                                    "Y": "COORDY",
+                                    "Z": "COORDZ",
+                                    "heading": "HEADING",
+                                    "load_state":"state",
+                                    "pitch": "PITCH",
+                                    "SPEED":"speed",
+                                    "UNIX_TIMESTAMP": "TIMESTAMPLOCAL"
+                                    }, inplace=True)
+        df_result["ROLL"] = 0
+        print("corrio todo")
+        # df_result = df_result[["MACHINENAME", "COORDX", "COORDY", "COORDZ", "HEADING", "PITCH", "ROLL","TIMESTAMPLOCAL"]].copy()
+        
+        
+        ## Bloque: Normalización de longitud de registros por camión ##
+        max_records = df_result["MACHINENAME"].value_counts().max()
+        # Liverlin
+        # df_result.drop(columns=["timestamp","dx","dy","dz"],inplace=True)
+        normalized_dfs = []
+        df_result.to_csv("df_result1.csv",index=False)
+        for truck_id in df_result["MACHINENAME"].unique():
+            # Filtrar datos del camión actual
+            truck_df = df_result[df_result["MACHINENAME"] == truck_id].copy()
+            truck_df.reset_index(inplace=True,drop=True)
+            current_records = len(truck_df)
+            # Si ya tiene el máximo, lo dejamos igual
+            if current_records == max_records:
+                normalized_dfs.append(truck_df)
+                continue
+            # Si tiene menos registros, rellenamos
+            missing_records = max_records - current_records
+            # Tomamos el último registro válido
+            last_valid_row = truck_df.iloc[-1].copy()
+            # Generamos filas nuevas con -1 en X, Y, Z y timestamp incrementado
+            new_rows = []
+            last_timestamp = last_valid_row["TIMESTAMPLOCAL"]
+            print(truck_id,last_timestamp)
+            for i in range(1, missing_records + 1):
+                new_timestamp = last_timestamp + i
+                # print(new_timestamp, int(new_timestamp.timestamp()))
+                new_row = {
+                    "MACHINENAME": truck_id,
+                    "COORDX": -1,
+                    "COORDY": -1,
+                    "COORDZ": -1,
+                    "speed": -1,
+                    "state": "No data",
+                    "status": "No data",
+                    "destiny":"No data",
+                    "HEADING":-1,
+                    "PITCH": -1,
+                    "ROLL":-1,
+                    "loaded":False,
+                    "TIMESTAMPLOCAL": new_timestamp
+                }
+                new_rows.append(new_row)
+            # Convertimos las nuevas filas en DataFrame y las unimos
+            new_rows_df = pd.DataFrame(new_rows)
+            truck_df_normalized = pd.concat([truck_df, new_rows_df], ignore_index=True)
+            normalized_dfs.append(truck_df_normalized)
+        # Combinamos todos los DataFrames normalizados
+        df_result = pd.concat(normalized_dfs, ignore_index=True)
+        
+        
+        ## Bloque: Adición de shovels y guardado final de CSVs ##
+        #f_name=datetime.now().strftime("%Y-%m-%d-%H-%M-%S")    
+        f_name=datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+        df_result=pd.concat([df_result,self.df_shovels])
+        # Modificacion
+        # df_result = self.generate_speed(df_result)
+        # --- 4) Guardado df_result2.csv: versión final con datos de shovels añadidos y lista de CSV rotativos
+        # Este CSV se vuelca en tmp/gpsdata con timestamp en el nombre para consumo externo.
+        df_result.to_csv("df_result2.csv",index=False)
+        carpeta = Path('./tmp/gpsdata/')
+        carpeta.mkdir(parents=True, exist_ok=True)
+        MAX_CSV_FILES=50
+        # Eliminar archivos antiguos si se supera el límite
+        archivos = sorted(
+            carpeta.glob("*.csv"),
+            key=lambda f: f.stat().st_mtime
+        )
+        if len(archivos) >= MAX_CSV_FILES:
+            for archivo in archivos[:len(archivos) - MAX_CSV_FILES + 1]:
+                try:
+                    archivo.unlink()
+                except Exception as e:
+                    print(f"Error al eliminar {archivo}: {e}")
+        df_result.to_csv(f"{carpeta}/{f_name}.csv",index=False)
+        print(df_result.value_counts("MACHINENAME"))
+        
+        
+        ## Bloque: Retorno del máximo conteo de puntos interpolados ##
+        conteo = df_result.groupby("MACHINENAME").size()
+        max_conteo = conteo.max()
+        return max_conteo
